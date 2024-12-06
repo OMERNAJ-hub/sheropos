@@ -1,14 +1,19 @@
 import * as ort from 'onnxruntime-web';
 import { DetectedObject } from './productDetection';
 
-// تكوين ONNX Runtime
+// تكوين ONNX Runtime مع تحسينات الأداء
 const options: ort.InferenceSession.SessionOptions = {
-  executionProviders: ['webgl', 'wasm'],
-  graphOptimizationLevel: 'all'
+  executionProviders: ['webgl'],
+  graphOptimizationLevel: 'all',
+  enableCpuMemArena: true,
+  enableMemPattern: true,
+  executionMode: 'sequential',
+  logSeverityLevel: 0
 };
 
 // تعيين مسار WASM
 ort.env.wasm.wasmPaths = '/onnx/';
+ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
 
 // تعيين مسار النموذج
 const MODEL_PATH = '/models/yolov8n.onnx';
@@ -43,25 +48,23 @@ const ARABIC_NAMES: { [key: string]: string } = {
 
 let session: ort.InferenceSession | null = null;
 let isInitializing = false;
+let lastProcessingTime = 0;
+const PROCESSING_INTERVAL = 100; // معالجة كل 100 مللي ثانية
 
 export async function initializeYOLO(): Promise<void> {
   if (isInitializing || session) return;
 
   try {
     isInitializing = true;
-    console.log('🚀 بدء تهيئة نموذج YOLO...');
-    console.log('📂 مسار النموذج:', MODEL_PATH);
+    console.log('🔄 جاري تهيئة نموذج YOLO...');
 
     // تحميل النموذج
     session = await ort.InferenceSession.create(MODEL_PATH, options);
-    console.log('✅ تم تحميل النموذج بنجاح!');
-    console.log('ℹ️ معلومات النموذج:', {
-      inputs: session.inputNames,
-      outputs: session.outputNames
-    });
+    console.log('✅ تم تحميل نموذج YOLO بنجاح');
 
   } catch (error) {
-    console.error('❌ خطأ في تهيئة النموذج:', error);
+    console.error('❌ خطأ في تهيئة نموذج YOLO:', error);
+    session = null;
     throw error;
   } finally {
     isInitializing = false;
@@ -70,81 +73,89 @@ export async function initializeYOLO(): Promise<void> {
 
 export async function detectWithYOLO(videoElement: HTMLVideoElement): Promise<DetectedObject[]> {
   if (!session) {
-    console.error('❌ لم يتم تهيئة النموذج');
-    throw new Error('لم يتم تهيئة النموذج');
+    throw new Error('لم يتم تهيئة نموذج YOLO بعد');
   }
+
+  const now = Date.now();
+  if (now - lastProcessingTime < PROCESSING_INTERVAL) {
+    return [];
+  }
+  lastProcessingTime = now;
 
   try {
-    console.log('🔍 بدء الكشف عن المنتجات...');
-
-    // إنشاء canvas مؤقت
-    const canvas = document.createElement('canvas');
-    canvas.width = videoElement.videoWidth;
-    canvas.height = videoElement.videoHeight;
-    const ctx = canvas.getContext('2d');
+    // تحويل الفيديو إلى تنسور
+    const tensor = await preprocessImage(videoElement);
     
-    if (!ctx) {
-      throw new Error('فشل في إنشاء سياق Canvas');
-    }
-
-    // رسم الإطار الحالي على canvas
-    ctx.drawImage(videoElement, 0, 0);
-
-    // الحصول على بيانات الصورة
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-    // معالجة الصورة
-    const inputArray = new Float32Array(imageData.width * imageData.height * 3);
-    let inputIndex = 0;
-
-    for (let y = 0; y < imageData.height; y++) {
-      for (let x = 0; x < imageData.width; x++) {
-        const pixelIndex = (y * imageData.width + x) * 4;
-        inputArray[inputIndex++] = imageData.data[pixelIndex] / 255.0;     // R
-        inputArray[inputIndex++] = imageData.data[pixelIndex + 1] / 255.0; // G
-        inputArray[inputIndex++] = imageData.data[pixelIndex + 2] / 255.0; // B
-      }
-    }
-
     // تشغيل النموذج
-    console.log('🤖 تشغيل النموذج...');
-    const tensor = new ort.Tensor('float32', inputArray, [1, 3, imageData.height, imageData.width]);
-    const outputs = await session.run({ images: tensor });
-    const predictions = outputs[session.outputNames[0]].data as Float32Array;
+    const feeds: Record<string, ort.Tensor> = {};
+    feeds[session.inputNames[0]] = tensor;
+    
+    const results = await session.run(feeds);
+    const output = results[session.outputNames[0]];
 
     // معالجة النتائج
-    const detections: DetectedObject[] = [];
-    const numPredictions = predictions.length / 7;
-
-    console.log('📊 عدد التوقعات:', numPredictions);
-
-    for (let i = 0; i < numPredictions; i++) {
-      const offset = i * 7;
-      const confidence = predictions[offset + 4];
-      const classId = Math.floor(predictions[offset + 5]);
-      const className = PRODUCT_CLASSES[classId];
-
-      if (confidence > 0.5 && className) {
-        const x = predictions[offset] * canvas.width;
-        const y = predictions[offset + 1] * canvas.height;
-        const width = (predictions[offset + 2] - predictions[offset]) * canvas.width;
-        const height = (predictions[offset + 3] - predictions[offset + 1]) * canvas.height;
-
-        detections.push({
-          id: `${i}-${Date.now()}`,
-          name: ARABIC_NAMES[className] || className,
-          confidence,
-          bbox: { x, y, width, height },
-          timestamp: Date.now()
-        });
-      }
-    }
-
-    console.log('✨ تم اكتشاف المنتجات:', detections);
-    return detections;
-
+    return processDetections(output, videoElement.width, videoElement.height);
   } catch (error) {
     console.error('❌ خطأ في الكشف:', error);
-    throw error;
+    return [];
   }
+}
+
+async function preprocessImage(videoElement: HTMLVideoElement): Promise<ort.Tensor> {
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 640;
+  const ctx = canvas.getContext('2d')!;
+  
+  // رسم الفيديو على Canvas مع الحفاظ على النسبة
+  const scale = Math.min(640 / videoElement.videoWidth, 640 / videoElement.videoHeight);
+  const width = videoElement.videoWidth * scale;
+  const height = videoElement.videoHeight * scale;
+  const x = (640 - width) / 2;
+  const y = (640 - height) / 2;
+  
+  ctx.drawImage(videoElement, x, y, width, height);
+  
+  // تحويل البيانات إلى Float32Array
+  const imageData = ctx.getImageData(0, 0, 640, 640);
+  const data = new Float32Array(3 * 640 * 640);
+  
+  for (let i = 0; i < imageData.data.length / 4; i++) {
+    data[i] = imageData.data[i * 4] / 255.0;
+    data[i + 640 * 640] = imageData.data[i * 4 + 1] / 255.0;
+    data[i + 2 * 640 * 640] = imageData.data[i * 4 + 2] / 255.0;
+  }
+  
+  return new ort.Tensor('float32', data, [1, 3, 640, 640]);
+}
+
+function processDetections(output: ort.Tensor, width: number, height: number): DetectedObject[] {
+  const data = output.data as Float32Array;
+  const results: DetectedObject[] = [];
+  const numDetections = data.length / 84; // 84 = 4 (bbox) + 80 (classes)
+  
+  for (let i = 0; i < numDetections; i++) {
+    const scores = data.slice(i * 84 + 4, (i + 1) * 84);
+    const classId = scores.indexOf(Math.max(...scores));
+    const confidence = scores[classId];
+    
+    if (confidence > 0.5 && PRODUCT_CLASSES.includes(PRODUCT_CLASSES[classId])) {
+      const bbox = {
+        x: data[i * 84] * width,
+        y: data[i * 84 + 1] * height,
+        width: (data[i * 84 + 2] - data[i * 84]) * width,
+        height: (data[i * 84 + 3] - data[i * 84 + 1]) * height
+      };
+      
+      results.push({
+        id: `${Date.now()}-${i}`,
+        name: ARABIC_NAMES[PRODUCT_CLASSES[classId]] || PRODUCT_CLASSES[classId],
+        confidence,
+        bbox,
+        timestamp: Date.now()
+      });
+    }
+  }
+  
+  return results;
 }
